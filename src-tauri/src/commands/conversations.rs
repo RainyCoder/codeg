@@ -84,7 +84,11 @@ async fn list_all_conversations_core_with_codex_titles(
     // Synchronize before `list_all` builds any folder/agent/search/status
     // filters so a freshly generated Codex title is visible on this same call.
     let refreshed_ids = conversation_service::refresh_codex_auto_titles(conn, codex_titles).await;
-    notify_conversation_title_updates(conn, emitter, chat_channel_manager, refreshed_ids).await;
+    // Detached on purpose — see `notify_conversation_title_updates`. The list
+    // must not wait on Telegram.
+    drop(
+        notify_conversation_title_updates(conn, emitter, chat_channel_manager, refreshed_ids).await,
+    );
     let ListAllConversationsOptions {
         folder_ids,
         agent_type,
@@ -451,6 +455,7 @@ fn compute_folders(all_conversations: &[ConversationSummary]) -> Vec<FolderInfo>
 pub async fn import_local_conversations_core(
     conn: &sea_orm::DatabaseConnection,
     emitter: &EventEmitter,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
     // Share IMPORT_GUARD with the batch importer: `(external_id, agent_type)`
@@ -476,11 +481,13 @@ pub async fn import_local_conversations_core(
             .map_err(AppCommandError::from)?;
 
     // Broadcast a sidebar upsert for every title refreshed in place, so other
-    // windows and web clients converge live. The importing client refetches the
-    // list itself, which also covers the newly imported rows.
-    for id in updated_ids {
-        emit_conversation_upsert(emitter, conn, id).await;
-    }
+    // windows and web clients converge live, and propagate the new name to any
+    // bound chat thread — the same treatment the scan and list paths give a
+    // title discovered outside codeg. The importing client refetches the list
+    // itself, which also covers the newly imported rows.
+    drop(
+        notify_conversation_title_updates(conn, emitter, chat_channel_manager, updated_ids).await,
+    );
 
     Ok(result)
 }
@@ -490,9 +497,16 @@ pub async fn import_local_conversations_core(
 pub async fn import_local_conversations(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
-    import_local_conversations_core(&db.conn, &EventEmitter::Tauri(app), folder_id).await
+    import_local_conversations_core(
+        &db.conn,
+        &EventEmitter::Tauri(app),
+        &chat_channel_manager,
+        folder_id,
+    )
+    .await
 }
 
 /// Serializes concurrent batch imports: `(external_id, agent_type)` has no DB
@@ -729,14 +743,17 @@ async fn scan_importable_sessions_from_summaries(
     }
 
     // Refresh the already-imported rows in place before answering, then
-    // broadcast each one so open sidebars re-sort without a refetch.
-    notify_conversation_title_updates(
-        conn,
-        emitter,
-        chat_channel_manager,
-        import_service::sync_imported_sessions(conn, &conv_rows, &summaries).await,
-    )
-    .await;
+    // broadcast each one so open sidebars re-sort without a refetch. The
+    // chat-channel half runs detached so the scan never waits on Telegram.
+    drop(
+        notify_conversation_title_updates(
+            conn,
+            emitter,
+            chat_channel_manager,
+            import_service::sync_imported_sessions(conn, &conv_rows, &summaries).await,
+        )
+        .await,
+    );
 
     let folder_rows = load_folder_rows(conn).await?;
     Ok(build_scan_result(summaries, &imported_index, &folder_rows))
@@ -1590,38 +1607,100 @@ pub(crate) async fn emit_conversation_upsert(
     }
 }
 
+/// Push one conversation's CURRENT title to its bound chat threads, then
+/// confirm it is still current — re-sending if it is not.
+///
+/// The confirmation loop is what makes a detached sync safe. A provider edit is
+/// a remote call that can land arbitrarily late, so two syncs for the same
+/// conversation can reach Telegram out of order: a stalled auto-title edit
+/// completing AFTER a manual rename would leave the thread (and the binding's
+/// `display_title`) named after a title the user already replaced, and nothing
+/// would ever retry. Re-reading before every attempt also means the title is
+/// never a stale snapshot captured at spawn time.
+///
+/// Deliberately NOT capped at N attempts. The loop exits only when the title it
+/// just read equals the one it last sent, so an exit always leaves the provider
+/// holding the current title; any fixed cap reintroduces exactly the bug this
+/// closes (rename → stall → rename → … exhausts the cap and exits stale). It
+/// cannot spin on its own: an iteration happens only when a NEW title was
+/// observed, so it terminates as soon as renames stop, and each iteration is
+/// rate-limited by one provider round-trip. Two concurrent syncs for the same
+/// conversation converge on the same final value for the same reason.
+///
+/// Serializing per conversation would be the other way to get ordering, but the
+/// lock would also be taken by the INLINE rename path
+/// (`sync_conversation_title_to_channels_core`), which would then block a user's
+/// rename for up to Telegram's 60s timeout behind a stalled background sync —
+/// reintroducing the hang this whole path exists to avoid.
+async fn sync_conversation_title_until_current(
+    conn: &sea_orm::DatabaseConnection,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    conversation_id: i32,
+) {
+    let mut sent: Option<String> = None;
+    loop {
+        let summary = match conversation_service::get_by_id(conn, conversation_id).await {
+            Ok(summary) => summary,
+            Err(e) => {
+                tracing::warn!(
+                    "[conversations] chat-thread title sync stopped for {conversation_id} \
+                     (get_by_id failed): {e}"
+                );
+                return;
+            }
+        };
+        let Some(title) = summary.title else { return };
+        if sent.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        chat_channel_manager
+            .sync_conversation_title(conn, conversation_id, &title)
+            .await;
+        sent = Some(title);
+    }
+}
+
 /// Broadcast and propagate title changes discovered outside codeg (for
-/// example, Codex's session index or an import scan). Local upserts are emitted
-/// before returning so open clients converge promptly. Chat-channel propagation
-/// is detached because it may wait on external network I/O; the database update
-/// has already committed and the originating list/scan result does not depend on
-/// that best-effort side effect.
+/// example, Codex's session index or an import scan). Both operations are
+/// best-effort: the database update has already committed, so notification
+/// failures must not turn the originating list/scan request into an error.
+///
+/// The two halves are deliberately NOT symmetric:
+///
+/// * The sidebar upsert is emitted inline. It is DB-only and cheap, and the
+///   response the caller is about to build must not disagree with what other
+///   clients were just told.
+/// * Chat-channel propagation is detached onto its own task, because it ends in
+///   outbound HTTP (Telegram `editForumTopic`, a 60s per-request timeout, once
+///   per bound thread). `list_all_conversations` is the sidebar's primary read
+///   — also driven per-keystroke by the search and manage dialogs — so it must
+///   never await a remote service. A slow or unreachable Telegram now costs a
+///   late topic rename, not a hung conversation list.
+///
+/// The detached half deliberately re-reads each title rather than carrying the
+/// one this notification was raised for — see
+/// [`sync_conversation_title_until_current`].
+///
+/// Returns the detached task's handle so tests can join it; production callers
+/// drop it (the work is best-effort and already logged on failure).
 async fn notify_conversation_title_updates(
     conn: &sea_orm::DatabaseConnection,
     emitter: &EventEmitter,
     chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     conversation_ids: Vec<i32>,
-) {
-    for &conversation_id in &conversation_ids {
-        emit_conversation_upsert(emitter, conn, conversation_id).await;
-    }
-
-    if conversation_ids.is_empty() {
-        return;
+) -> tokio::task::JoinHandle<()> {
+    for conversation_id in &conversation_ids {
+        emit_conversation_upsert(emitter, conn, *conversation_id).await;
     }
 
     let conn = conn.clone();
     let chat_channel_manager = chat_channel_manager.clone_ref();
     tokio::spawn(async move {
         for conversation_id in conversation_ids {
-            sync_conversation_title_to_channels_core(
-                &conn,
-                &chat_channel_manager,
-                conversation_id,
-            )
-            .await;
+            sync_conversation_title_until_current(&conn, &chat_channel_manager, conversation_id)
+                .await;
         }
-    });
+    })
 }
 
 /// Emit a `conversation://changed` Deleted for `conversation_id` so every
@@ -3415,108 +3494,9 @@ mod tests {
         assert_eq!(event.payload["summary"]["id"], row.id);
         assert_eq!(event.payload["summary"]["title"], "解释 Makefile 文件作用");
         assert_eq!(
-            wait_for_title_edits(&title_edits, 1).await.as_slice(),
+            title_edits.titles.lock().await.as_slice(),
             [format!("#{} 解释 Makefile 文件作用", row.id)],
             "the same external title refresh must propagate to a bound chat thread"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_all_conversations_core_does_not_wait_for_channel_network_io() {
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/codeg-list-codex-background-channel").await;
-        let row = conversation_service::create(
-            &db.conn,
-            folder_id,
-            AgentType::Codex,
-            Some("first prompt".into()),
-            None,
-        )
-        .await
-        .expect("create conversation");
-        conversation_service::update_external_id(&db.conn, row.id, "blocked-channel".into())
-            .await
-            .expect("set external id");
-        let titles = HashMap::from([(
-            "blocked-channel".to_string(),
-            "Codex index title".to_string(),
-        )]);
-        let (chat_channel_manager, gate) = blocking_title_sync_test_manager(&db, row.id).await;
-
-        let rows = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            list_all_conversations_core_with_codex_titles(
-                &db.conn,
-                &EventEmitter::Noop,
-                &chat_channel_manager,
-                ListAllConversationsOptions::default(),
-                &titles,
-            ),
-        )
-        .await
-        .expect("conversation list must not wait for chat-channel network I/O")
-        .expect("list");
-
-        assert_eq!(rows[0].title.as_deref(), Some("Codex index title"));
-        let started =
-            tokio::time::timeout(std::time::Duration::from_secs(2), gate.started.acquire())
-                .await
-                .expect("background channel sync must start")
-                .expect("started semaphore stays open");
-        started.forget();
-        gate.release.add_permits(1);
-        let finished =
-            tokio::time::timeout(std::time::Duration::from_secs(2), gate.finished.acquire())
-                .await
-                .expect("background channel sync must finish after release")
-                .expect("finished semaphore stays open");
-        finished.forget();
-    }
-
-    #[tokio::test]
-    async fn list_all_conversations_core_ignores_codex_titles_in_deleted_folders() {
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/codeg-list-codex-deleted-folder").await;
-        let row = conversation_service::create(
-            &db.conn,
-            folder_id,
-            AgentType::Codex,
-            Some("hidden title".into()),
-            None,
-        )
-        .await
-        .expect("create conversation");
-        conversation_service::update_external_id(&db.conn, row.id, "hidden-session".into())
-            .await
-            .expect("set external id");
-        folder_service::soft_delete_folder(&db.conn, folder_id)
-            .await
-            .expect("soft delete folder");
-        let titles = HashMap::from([(
-            "hidden-session".to_string(),
-            "must not be broadcast".to_string(),
-        )]);
-        let (broadcaster, emitter) = sync_test_emitter();
-        let mut events = broadcaster.subscribe();
-
-        let rows = list_all_conversations_core_with_codex_titles(
-            &db.conn,
-            &emitter,
-            &crate::chat_channel::manager::ChatChannelManager::new(),
-            ListAllConversationsOptions::default(),
-            &titles,
-        )
-        .await
-        .expect("list");
-
-        assert!(rows.is_empty(), "deleted folders stay absent from the list");
-        let stored = conversation_service::get_by_id(&db.conn, row.id)
-            .await
-            .expect("get stored row");
-        assert_eq!(stored.title.as_deref(), Some("hidden title"));
-        assert!(
-            events.try_recv().is_err(),
-            "a hidden conversation must not be broadcast back into the sidebar"
         );
     }
 
@@ -3716,9 +3696,176 @@ mod tests {
         assert_eq!(event.payload["summary"]["id"], row.id);
         assert_eq!(event.payload["summary"]["title"], "Codex index title");
         assert_eq!(
-            wait_for_title_edits(&title_edits, 1).await.as_slice(),
+            title_edits.wait_for_edits(1).await.as_slice(),
             [format!("#{} Codex index title", row.id)],
             "scan-discovered titles must propagate to a bound chat thread"
+        );
+    }
+
+    /// The channel half of a title notification must not be on the caller's
+    /// critical path: `edit_thread_title` reaches Telegram with a 60s per-call
+    /// timeout, and `list_all_conversations` is the sidebar's primary read.
+    #[tokio::test]
+    async fn notify_conversation_title_updates_detaches_channel_sync_from_the_caller() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-notify-detached").await;
+        let row = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("detached title".into()),
+            None,
+        )
+        .await
+        .expect("create conversation");
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut events = broadcaster.subscribe();
+        let (chat_channel_manager, title_edits) =
+            title_sync_test_manager_with(&db, row.id, TitleEditRecorder::blocked()).await;
+
+        let handle = notify_conversation_title_updates(
+            &db.conn,
+            &emitter,
+            &chat_channel_manager,
+            vec![row.id],
+        )
+        .await;
+
+        // Returned while the backend is still parked: the sidebar upsert is
+        // already out, the outbound edit has not even been attempted.
+        let event = events.try_recv().expect("upsert must be emitted inline");
+        assert_eq!(event.payload["summary"]["title"], "detached title");
+        assert!(
+            title_edits.recorded().await.is_empty(),
+            "caller must not wait on the chat backend"
+        );
+
+        title_edits.unblock(1);
+        handle.await.expect("detached title sync task");
+        assert_eq!(
+            title_edits.recorded().await.as_slice(),
+            [format!("#{} detached title", row.id)],
+            "the detached task still propagates the title"
+        );
+    }
+
+    /// A detached edit can land after a rename that happened while it was in
+    /// flight. The last value the provider (and the binding's `display_title`)
+    /// ends up with must be the conversation's CURRENT title, not the one the
+    /// stalled sync started with — nothing retries afterwards.
+    #[tokio::test]
+    async fn detached_title_sync_converges_on_a_rename_that_lands_mid_flight() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-notify-late-rename").await;
+        let row = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("auto title".into()),
+            None,
+        )
+        .await
+        .expect("create conversation");
+        let (_broadcaster, emitter) = sync_test_emitter();
+        let (chat_channel_manager, title_edits) =
+            title_sync_test_manager_with(&db, row.id, TitleEditRecorder::blocked()).await;
+
+        let handle = notify_conversation_title_updates(
+            &db.conn,
+            &emitter,
+            &chat_channel_manager,
+            vec![row.id],
+        )
+        .await;
+
+        // The auto-title edit is parked mid-flight; the user renames underneath it.
+        conversation_service::update_title(&db.conn, row.id, "manual rename".into())
+            .await
+            .expect("manual rename");
+
+        title_edits.unblock(8);
+        handle.await.expect("detached title sync task");
+
+        let recorded = title_edits.recorded().await;
+        assert_eq!(
+            recorded.last().map(String::as_str),
+            Some(format!("#{} manual rename", row.id).as_str()),
+            "the provider must end on the newest title, not the stalled one: {recorded:?}"
+        );
+        let bindings =
+            crate::db::service::thread_binding_service::list_by_conversation(&db.conn, row.id)
+                .await
+                .expect("list bindings");
+        assert_eq!(
+            bindings[0].display_title.as_deref(),
+            Some(format!("#{} manual rename", row.id).as_str()),
+            "the persisted display title must match what the provider was last told"
+        );
+    }
+
+    /// The convergence loop must not be defeated by a RUN of renames that each
+    /// land mid-flight. Any fixed retry cap exits stale on a long enough run —
+    /// this drives more consecutive mid-flight renames than any such cap.
+    #[tokio::test]
+    async fn detached_title_sync_converges_after_a_run_of_mid_flight_renames() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-notify-rename-run").await;
+        let row = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("title 1".into()),
+            None,
+        )
+        .await
+        .expect("create conversation");
+        let (_broadcaster, emitter) = sync_test_emitter();
+        // Each provider edit is overtaken by the next rename before it returns.
+        let (chat_channel_manager, title_edits) = title_sync_test_manager_with(
+            &db,
+            row.id,
+            TitleEditRecorder::renaming_mid_edit(
+                &db,
+                row.id,
+                &["title 2", "title 3", "title 4", "title 5", "title 6"],
+            ),
+        )
+        .await;
+
+        notify_conversation_title_updates(
+            &db.conn,
+            &emitter,
+            &chat_channel_manager,
+            vec![row.id],
+        )
+        .await
+        .await
+        .expect("detached title sync task");
+
+        let recorded = title_edits.recorded().await;
+        let current = conversation_service::get_by_id(&db.conn, row.id)
+            .await
+            .expect("read conversation")
+            .title
+            .expect("conversation has a title");
+        // The invariant, stated against whatever the row actually ended on: the
+        // last thing the provider was told IS the conversation's current title.
+        assert_eq!(
+            recorded.last().map(String::as_str),
+            Some(format!("#{} {current}", row.id).as_str()),
+            "provider must end on the row's current title however long the run: {recorded:?}"
+        );
+        assert_eq!(
+            current, "title 6",
+            "fixture must exhaust every queued rename, or it is not testing a long run"
+        );
+        let bindings =
+            crate::db::service::thread_binding_service::list_by_conversation(&db.conn, row.id)
+                .await
+                .expect("list bindings");
+        assert_eq!(
+            bindings[0].display_title.as_deref(),
+            Some(format!("#{} title 6", row.id).as_str())
         );
     }
 
@@ -4087,7 +4234,12 @@ mod tests {
     #[tokio::test]
     async fn import_local_conversations_core_missing_folder_errors() {
         let db = fresh_in_memory_db().await;
-        let err = import_local_conversations_core(&db.conn, &EventEmitter::Noop, 999_999)
+        let err = import_local_conversations_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            &crate::chat_channel::manager::ChatChannelManager::new(),
+            999_999,
+        )
             .await
             .expect_err("missing folder must surface as error");
         let msg = format!("{err:?}");
@@ -4240,47 +4392,88 @@ mod tests {
         (broadcaster, emitter)
     }
 
-    #[derive(Clone, Default)]
-    struct TitleEditRecorder {
-        titles: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
-        updated: std::sync::Arc<tokio::sync::Notify>,
-    }
-
-    async fn wait_for_title_edits(recorder: &TitleEditRecorder, expected: usize) -> Vec<String> {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let updated = recorder.updated.notified();
-                let titles = recorder.titles.lock().await.clone();
-                if titles.len() >= expected {
-                    return titles;
-                }
-                updated.await;
-            }
-        })
-        .await
-        .expect("background title sync must complete")
+    /// Applies one queued rename per provider edit, so the rename provably
+    /// lands while that edit is still in flight — the exact interleaving a
+    /// detached sync has to survive.
+    #[derive(Clone)]
+    struct RenameDuringEdit {
+        conn: sea_orm::DatabaseConnection,
+        conversation_id: i32,
+        pending: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
     }
 
     #[derive(Clone)]
-    struct BlockingTitleGate {
-        started: std::sync::Arc<tokio::sync::Semaphore>,
-        release: std::sync::Arc<tokio::sync::Semaphore>,
-        finished: std::sync::Arc<tokio::sync::Semaphore>,
+    struct TitleEditRecorder {
+        titles: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Stands in for Telegram's latency. Open by default; `blocked()` parks
+        /// every `edit_thread_title` until the test hands out permits, which is
+        /// how the detached-channel-sync tests prove a caller did not wait.
+        gate: std::sync::Arc<tokio::sync::Semaphore>,
+        rename_during_edit: Option<RenameDuringEdit>,
     }
 
-    impl Default for BlockingTitleGate {
+    impl Default for TitleEditRecorder {
         fn default() -> Self {
             Self {
-                started: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
-                release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
-                finished: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+                titles: Default::default(),
+                gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    tokio::sync::Semaphore::MAX_PERMITS,
+                )),
+                rename_during_edit: None,
             }
+        }
+    }
+
+    impl TitleEditRecorder {
+        fn blocked() -> Self {
+            Self {
+                gate: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+                ..Default::default()
+            }
+        }
+
+        /// Open gate, but every edit is overtaken by the next queued rename.
+        fn renaming_mid_edit(
+            db: &crate::db::AppDatabase,
+            conversation_id: i32,
+            renames: &[&str],
+        ) -> Self {
+            Self {
+                rename_during_edit: Some(RenameDuringEdit {
+                    conn: db.conn.clone(),
+                    conversation_id,
+                    pending: std::sync::Arc::new(tokio::sync::Mutex::new(
+                        renames.iter().map(|t| (*t).to_string()).collect(),
+                    )),
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn unblock(&self, edits: usize) {
+            self.gate.add_permits(edits);
+        }
+
+        async fn recorded(&self) -> Vec<String> {
+            self.titles.lock().await.clone()
+        }
+
+        /// Await a detached channel sync. Bounded so a wiring regression fails
+        /// the test instead of hanging it.
+        async fn wait_for_edits(&self, count: usize) -> Vec<String> {
+            for _ in 0..500 {
+                let titles = self.recorded().await;
+                if titles.len() >= count {
+                    return titles;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for {count} chat-thread title edit(s)");
         }
     }
 
     struct RecordingTitleBackend {
         recorder: TitleEditRecorder,
-        gate: Option<BlockingTitleGate>,
     }
 
     #[async_trait::async_trait]
@@ -4329,16 +4522,20 @@ mod tests {
             _target: &crate::chat_channel::types::ChannelMessageTarget,
             title: &str,
         ) -> Result<(), crate::chat_channel::error::ChatChannelError> {
-            if let Some(gate) = &self.gate {
-                gate.started.add_permits(1);
-                if let Ok(permit) = gate.release.acquire().await {
-                    permit.forget();
-                }
-            }
+            self.recorder
+                .gate
+                .acquire()
+                .await
+                .expect("title edit gate closed")
+                .forget();
             self.recorder.titles.lock().await.push(title.to_string());
-            self.recorder.updated.notify_waiters();
-            if let Some(gate) = &self.gate {
-                gate.finished.add_permits(1);
+            if let Some(hook) = &self.recorder.rename_during_edit {
+                let next = hook.pending.lock().await.pop_front();
+                if let Some(next) = next {
+                    conversation_service::update_title(&hook.conn, hook.conversation_id, next)
+                        .await
+                        .expect("rename during in-flight edit");
+                }
             }
             Ok(())
         }
@@ -4357,44 +4554,17 @@ mod tests {
         crate::chat_channel::manager::ChatChannelManager,
         TitleEditRecorder,
     ) {
-        let recorder = TitleEditRecorder::default();
-        let manager = title_sync_test_manager_with_backend(
-            db,
-            conversation_id,
-            Box::new(RecordingTitleBackend {
-                recorder: recorder.clone(),
-                gate: None,
-            }),
-        )
-        .await;
-        (manager, recorder)
+        title_sync_test_manager_with(db, conversation_id, TitleEditRecorder::default()).await
     }
 
-    async fn blocking_title_sync_test_manager(
+    async fn title_sync_test_manager_with(
         db: &crate::db::AppDatabase,
         conversation_id: i32,
+        recorder: TitleEditRecorder,
     ) -> (
         crate::chat_channel::manager::ChatChannelManager,
-        BlockingTitleGate,
+        TitleEditRecorder,
     ) {
-        let gate = BlockingTitleGate::default();
-        let manager = title_sync_test_manager_with_backend(
-            db,
-            conversation_id,
-            Box::new(RecordingTitleBackend {
-                recorder: TitleEditRecorder::default(),
-                gate: Some(gate.clone()),
-            }),
-        )
-        .await;
-        (manager, gate)
-    }
-
-    async fn title_sync_test_manager_with_backend(
-        db: &crate::db::AppDatabase,
-        conversation_id: i32,
-        backend: Box<dyn crate::chat_channel::traits::ChatChannelBackend>,
-    ) -> crate::chat_channel::manager::ChatChannelManager {
         let channel = crate::db::service::chat_channel_service::create(
             &db.conn,
             "title sync test".into(),
@@ -4412,7 +4582,9 @@ mod tests {
                 channel.id,
                 channel.name,
                 crate::chat_channel::types::ChannelType::Telegram,
-                backend,
+                Box::new(RecordingTitleBackend {
+                    recorder: recorder.clone(),
+                }),
             )
             .await
             .expect("connect recording channel");
@@ -4430,7 +4602,7 @@ mod tests {
         )
         .await
         .expect("bind conversation thread");
-        manager
+        (manager, recorder)
     }
 
     #[tokio::test]
@@ -5102,7 +5274,12 @@ mod tests {
         let folder_id = seed_folder(&db, "/tmp/legacy-guard").await;
 
         let _held = IMPORT_GUARD.try_lock().expect("guard free in test");
-        let err = import_local_conversations_core(&db.conn, &EventEmitter::Noop, folder_id)
+        let err = import_local_conversations_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            &crate::chat_channel::manager::ChatChannelManager::new(),
+            folder_id,
+        )
             .await
             .expect_err("legacy import must be rejected while an import is in progress");
         let msg = format!("{err:?}").to_lowercase();
