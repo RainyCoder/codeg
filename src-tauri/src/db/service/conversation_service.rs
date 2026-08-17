@@ -316,10 +316,21 @@ async fn refresh_codex_auto_title_candidate(
         .filter(conversation::Column::ExternalId.eq(external_id))
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(conversation::Column::FolderId.in_subquery(active_folder_ids_query()))
         .filter(old_title)
         .exec(conn)
         .await?;
     Ok(res.rows_affected > 0)
+}
+
+fn active_folder_ids_query() -> sea_orm::sea_query::SelectStatement {
+    use sea_orm::sea_query::Query;
+
+    Query::select()
+        .column(folder::Column::Id)
+        .from(folder::Entity)
+        .and_where(folder::Column::DeletedAt.is_null())
+        .to_owned()
 }
 
 /// Refresh every live, unlocked Codex conversation whose external session id
@@ -352,6 +363,7 @@ pub(crate) async fn refresh_codex_auto_titles(
             .filter(conversation::Column::ExternalId.is_in(external_id_chunk.iter().cloned()))
             .filter(conversation::Column::DeletedAt.is_null())
             .filter(conversation::Column::TitleLocked.eq(false))
+            .filter(conversation::Column::FolderId.in_subquery(active_folder_ids_query()))
             .order_by_asc(conversation::Column::Id)
             .all(conn)
             .await
@@ -1694,6 +1706,81 @@ mod tests {
         let current = get_by_id(&db.conn, row.id).await.expect("read current row");
         assert!(current.title_locked);
         assert_eq!(current.title.as_deref(), Some("same manual title"));
+    }
+
+    #[tokio::test]
+    async fn refresh_codex_auto_titles_skips_soft_deleted_folders() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-codex-index-deleted-folder").await;
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("hidden title".into()),
+            None,
+        )
+        .await
+        .expect("create");
+        update_external_id(&db.conn, row.id, "session-in-deleted-folder".into())
+            .await
+            .expect("set external id");
+        crate::db::service::folder_service::soft_delete_folder(&db.conn, folder)
+            .await
+            .expect("soft delete folder");
+        let titles = HashMap::from([(
+            "session-in-deleted-folder".to_string(),
+            "must stay hidden".to_string(),
+        )]);
+
+        assert!(
+            refresh_codex_auto_titles(&db.conn, &titles)
+                .await
+                .is_empty(),
+            "a conversation in a deleted folder must not become a notification candidate"
+        );
+        let current = get_by_id(&db.conn, row.id).await.expect("get current row");
+        assert_eq!(current.title.as_deref(), Some("hidden title"));
+    }
+
+    #[tokio::test]
+    async fn refresh_codex_auto_title_candidate_rechecks_folder_at_write_time() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-codex-index-folder-race").await;
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("candidate title".into()),
+            None,
+        )
+        .await
+        .expect("create");
+        update_external_id(&db.conn, row.id, "session-folder-race".into())
+            .await
+            .expect("set external id");
+        let stale_candidate = conversation::Entity::find_by_id(row.id)
+            .one(&db.conn)
+            .await
+            .expect("query candidate")
+            .expect("candidate exists");
+
+        crate::db::service::folder_service::soft_delete_folder(&db.conn, folder)
+            .await
+            .expect("concurrently delete folder");
+        let wrote = refresh_codex_auto_title_candidate(
+            &db.conn,
+            &stale_candidate,
+            "stale session index title",
+        )
+        .await
+        .expect("conditional refresh");
+
+        assert!(
+            !wrote,
+            "a stale candidate must not update after its folder is deleted"
+        );
+        let current = get_by_id(&db.conn, row.id).await.expect("get current row");
+        assert_eq!(current.title.as_deref(), Some("candidate title"));
     }
 
     #[tokio::test]

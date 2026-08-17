@@ -1591,19 +1591,37 @@ pub(crate) async fn emit_conversation_upsert(
 }
 
 /// Broadcast and propagate title changes discovered outside codeg (for
-/// example, Codex's session index or an import scan). Both operations are
-/// best-effort: the database update has already committed, so notification
-/// failures must not turn the originating list/scan request into an error.
+/// example, Codex's session index or an import scan). Local upserts are emitted
+/// before returning so open clients converge promptly. Chat-channel propagation
+/// is detached because it may wait on external network I/O; the database update
+/// has already committed and the originating list/scan result does not depend on
+/// that best-effort side effect.
 async fn notify_conversation_title_updates(
     conn: &sea_orm::DatabaseConnection,
     emitter: &EventEmitter,
     chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     conversation_ids: Vec<i32>,
 ) {
-    for conversation_id in conversation_ids {
+    for &conversation_id in &conversation_ids {
         emit_conversation_upsert(emitter, conn, conversation_id).await;
-        sync_conversation_title_to_channels_core(conn, chat_channel_manager, conversation_id).await;
     }
+
+    if conversation_ids.is_empty() {
+        return;
+    }
+
+    let conn = conn.clone();
+    let chat_channel_manager = chat_channel_manager.clone_ref();
+    tokio::spawn(async move {
+        for conversation_id in conversation_ids {
+            sync_conversation_title_to_channels_core(
+                &conn,
+                &chat_channel_manager,
+                conversation_id,
+            )
+            .await;
+        }
+    });
 }
 
 /// Emit a `conversation://changed` Deleted for `conversation_id` so every
@@ -3397,9 +3415,108 @@ mod tests {
         assert_eq!(event.payload["summary"]["id"], row.id);
         assert_eq!(event.payload["summary"]["title"], "解释 Makefile 文件作用");
         assert_eq!(
-            title_edits.titles.lock().await.as_slice(),
+            wait_for_title_edits(&title_edits, 1).await.as_slice(),
             [format!("#{} 解释 Makefile 文件作用", row.id)],
             "the same external title refresh must propagate to a bound chat thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_conversations_core_does_not_wait_for_channel_network_io() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-list-codex-background-channel").await;
+        let row = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("first prompt".into()),
+            None,
+        )
+        .await
+        .expect("create conversation");
+        conversation_service::update_external_id(&db.conn, row.id, "blocked-channel".into())
+            .await
+            .expect("set external id");
+        let titles = HashMap::from([(
+            "blocked-channel".to_string(),
+            "Codex index title".to_string(),
+        )]);
+        let (chat_channel_manager, gate) = blocking_title_sync_test_manager(&db, row.id).await;
+
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            list_all_conversations_core_with_codex_titles(
+                &db.conn,
+                &EventEmitter::Noop,
+                &chat_channel_manager,
+                ListAllConversationsOptions::default(),
+                &titles,
+            ),
+        )
+        .await
+        .expect("conversation list must not wait for chat-channel network I/O")
+        .expect("list");
+
+        assert_eq!(rows[0].title.as_deref(), Some("Codex index title"));
+        let started =
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate.started.acquire())
+                .await
+                .expect("background channel sync must start")
+                .expect("started semaphore stays open");
+        started.forget();
+        gate.release.add_permits(1);
+        let finished =
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate.finished.acquire())
+                .await
+                .expect("background channel sync must finish after release")
+                .expect("finished semaphore stays open");
+        finished.forget();
+    }
+
+    #[tokio::test]
+    async fn list_all_conversations_core_ignores_codex_titles_in_deleted_folders() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-list-codex-deleted-folder").await;
+        let row = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("hidden title".into()),
+            None,
+        )
+        .await
+        .expect("create conversation");
+        conversation_service::update_external_id(&db.conn, row.id, "hidden-session".into())
+            .await
+            .expect("set external id");
+        folder_service::soft_delete_folder(&db.conn, folder_id)
+            .await
+            .expect("soft delete folder");
+        let titles = HashMap::from([(
+            "hidden-session".to_string(),
+            "must not be broadcast".to_string(),
+        )]);
+        let (broadcaster, emitter) = sync_test_emitter();
+        let mut events = broadcaster.subscribe();
+
+        let rows = list_all_conversations_core_with_codex_titles(
+            &db.conn,
+            &emitter,
+            &crate::chat_channel::manager::ChatChannelManager::new(),
+            ListAllConversationsOptions::default(),
+            &titles,
+        )
+        .await
+        .expect("list");
+
+        assert!(rows.is_empty(), "deleted folders stay absent from the list");
+        let stored = conversation_service::get_by_id(&db.conn, row.id)
+            .await
+            .expect("get stored row");
+        assert_eq!(stored.title.as_deref(), Some("hidden title"));
+        assert!(
+            events.try_recv().is_err(),
+            "a hidden conversation must not be broadcast back into the sidebar"
         );
     }
 
@@ -3599,7 +3716,7 @@ mod tests {
         assert_eq!(event.payload["summary"]["id"], row.id);
         assert_eq!(event.payload["summary"]["title"], "Codex index title");
         assert_eq!(
-            title_edits.titles.lock().await.as_slice(),
+            wait_for_title_edits(&title_edits, 1).await.as_slice(),
             [format!("#{} Codex index title", row.id)],
             "scan-discovered titles must propagate to a bound chat thread"
         );
@@ -4126,10 +4243,44 @@ mod tests {
     #[derive(Clone, Default)]
     struct TitleEditRecorder {
         titles: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        updated: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    async fn wait_for_title_edits(recorder: &TitleEditRecorder, expected: usize) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let updated = recorder.updated.notified();
+                let titles = recorder.titles.lock().await.clone();
+                if titles.len() >= expected {
+                    return titles;
+                }
+                updated.await;
+            }
+        })
+        .await
+        .expect("background title sync must complete")
+    }
+
+    #[derive(Clone)]
+    struct BlockingTitleGate {
+        started: std::sync::Arc<tokio::sync::Semaphore>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+        finished: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Default for BlockingTitleGate {
+        fn default() -> Self {
+            Self {
+                started: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+                release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+                finished: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
     }
 
     struct RecordingTitleBackend {
         recorder: TitleEditRecorder,
+        gate: Option<BlockingTitleGate>,
     }
 
     #[async_trait::async_trait]
@@ -4178,7 +4329,17 @@ mod tests {
             _target: &crate::chat_channel::types::ChannelMessageTarget,
             title: &str,
         ) -> Result<(), crate::chat_channel::error::ChatChannelError> {
+            if let Some(gate) = &self.gate {
+                gate.started.add_permits(1);
+                if let Ok(permit) = gate.release.acquire().await {
+                    permit.forget();
+                }
+            }
             self.recorder.titles.lock().await.push(title.to_string());
+            self.recorder.updated.notify_waiters();
+            if let Some(gate) = &self.gate {
+                gate.finished.add_permits(1);
+            }
             Ok(())
         }
 
@@ -4196,6 +4357,44 @@ mod tests {
         crate::chat_channel::manager::ChatChannelManager,
         TitleEditRecorder,
     ) {
+        let recorder = TitleEditRecorder::default();
+        let manager = title_sync_test_manager_with_backend(
+            db,
+            conversation_id,
+            Box::new(RecordingTitleBackend {
+                recorder: recorder.clone(),
+                gate: None,
+            }),
+        )
+        .await;
+        (manager, recorder)
+    }
+
+    async fn blocking_title_sync_test_manager(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+    ) -> (
+        crate::chat_channel::manager::ChatChannelManager,
+        BlockingTitleGate,
+    ) {
+        let gate = BlockingTitleGate::default();
+        let manager = title_sync_test_manager_with_backend(
+            db,
+            conversation_id,
+            Box::new(RecordingTitleBackend {
+                recorder: TitleEditRecorder::default(),
+                gate: Some(gate.clone()),
+            }),
+        )
+        .await;
+        (manager, gate)
+    }
+
+    async fn title_sync_test_manager_with_backend(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+        backend: Box<dyn crate::chat_channel::traits::ChatChannelBackend>,
+    ) -> crate::chat_channel::manager::ChatChannelManager {
         let channel = crate::db::service::chat_channel_service::create(
             &db.conn,
             "title sync test".into(),
@@ -4207,16 +4406,13 @@ mod tests {
         )
         .await
         .expect("create chat channel");
-        let recorder = TitleEditRecorder::default();
         let manager = crate::chat_channel::manager::ChatChannelManager::new();
         manager
             .add_channel(
                 channel.id,
                 channel.name,
                 crate::chat_channel::types::ChannelType::Telegram,
-                Box::new(RecordingTitleBackend {
-                    recorder: recorder.clone(),
-                }),
+                backend,
             )
             .await
             .expect("connect recording channel");
@@ -4234,7 +4430,7 @@ mod tests {
         )
         .await
         .expect("bind conversation thread");
-        (manager, recorder)
+        manager
     }
 
     #[tokio::test]
